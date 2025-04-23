@@ -47,7 +47,7 @@ namespace imagePain.Forms
         private void BuildUI()
         {
             Text = "Image Inpainting Tool";
-            Size = new System.Drawing.Size(1920, 1080);
+            Size = new System.Drawing.Size(1200, 800);
             BackColor = System.Drawing.Color.FromArgb(45, 45, 45);
             ForeColor = System.Drawing.Color.White;
 

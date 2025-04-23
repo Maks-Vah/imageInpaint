@@ -14,7 +14,10 @@ public sealed class ImageInpainter : IDisposable
 
     public ImageInpainter(string modelPath)
     {
-        var options = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL };
+        var options = new SessionOptions
+        {
+            GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL
+        };
 
         try { options.AppendExecutionProvider_CUDA(); }
         catch { options.AppendExecutionProvider_CPU(); }
@@ -24,75 +27,65 @@ public sealed class ImageInpainter : IDisposable
 
     public Image<Rgba32> Inpaint(Image<Rgba32> image, Image<Rgba32> mask)
     {
-        var (img, msk, crop) = PrepareInputs(image, mask);
-        var (imgTensor, maskTensor) = CreateTensors(img, msk);
+        var (preparedImage, preparedMask) = PrepareInputs(image, mask);
+        var (inputTensor, maskTensor) = CreateTensors(preparedImage, preparedMask);
+
+        // Сохраняем промежуточные данные для отладки
+        preparedImage.SaveAsPng("debug_input.png");
+        preparedMask.SaveAsPng("debug_mask.png");
 
         using var results = _session.Run(new[]
         {
-            NamedOnnxValue.CreateFromTensor("image", imgTensor),
+            NamedOnnxValue.CreateFromTensor("image", inputTensor),
             NamedOnnxValue.CreateFromTensor("mask", maskTensor)
         });
 
-        return PasteResult(results[0].AsTensor<float>(), image, crop);
+        return ProcessOutput(results[0].AsTensor<float>(), image, mask);
     }
 
-    private (Image<Rgba32>, Image<Rgba32>, Rectangle) PrepareInputs(Image<Rgba32> image, Image<Rgba32> mask)
+    private (Image<Rgba32>, Image<Rgba32>) PrepareInputs(Image<Rgba32> image, Image<Rgba32> mask)
     {
-        var bounds = GetMaskBounds(mask);
-        var cropRect = GetCropRect(bounds, image.Width, image.Height);
+        // 1. Подготовка изображения с паддингом
+        var processedImage = image.Clone();
+        processedImage.Mutate(x => x.Resize(new ResizeOptions
+        {
+            Size = new Size(TargetSize),
+            Mode = ResizeMode.Pad,
+            PadColor = Color.Black,
+            Sampler = KnownResamplers.Lanczos3
+        }));
 
-        var croppedImage = image.Clone(x => x.Crop(cropRect).Resize(TargetSize, TargetSize));
-        var croppedMask = mask.Clone(x => x.Crop(cropRect).Resize(TargetSize, TargetSize));
-
-        // Бинаризация маски
-        croppedMask.Mutate(x => x.BinaryThreshold(0.5f)); // Чётко, вместо ручного пиксельного перебора
-
-        return (croppedImage, croppedMask, cropRect);
-    }
-
-    private Rectangle GetMaskBounds(Image<Rgba32> mask)
-    {
-        int minX = mask.Width, minY = mask.Height, maxX = 0, maxY = 0;
-
-        mask.ProcessPixelRows(accessor =>
+        // 2. Подготовка маски (бинаризация + ресайз)
+        var processedMask = mask.Clone();
+        processedMask.ProcessPixelRows(accessor =>
         {
             for (int y = 0; y < accessor.Height; y++)
             {
                 var row = accessor.GetRowSpan(y);
                 for (int x = 0; x < row.Length; x++)
                 {
-                    if (row[x].R > 128)
-                    {
-                        minX = Math.Min(minX, x);
-                        minY = Math.Min(minY, y);
-                        maxX = Math.Max(maxX, x);
-                        maxY = Math.Max(maxY, y);
-                    }
+                    row[x] = row[x].R > 128 ? Color.White : Color.Black;
                 }
             }
         });
 
-        return minX > maxX || minY > maxY
-            ? new Rectangle(0, 0, 1, 1)
-            : Rectangle.FromLTRB(minX, minY, maxX + 1, maxY + 1);
-    }
+        processedMask.Mutate(x => x.Resize(new ResizeOptions
+        {
+            Size = new Size(TargetSize),
+            Mode = ResizeMode.Pad,
+            PadColor = Color.Black,
+            Sampler = KnownResamplers.NearestNeighbor
+        }));
 
-    private Rectangle GetCropRect(Rectangle bounds, int width, int height)
-    {
-        int centerX = bounds.X + bounds.Width / 2;
-        int centerY = bounds.Y + bounds.Height / 2;
-
-        int x = Math.Clamp(centerX - TargetSize / 2, 0, width - TargetSize);
-        int y = Math.Clamp(centerY - TargetSize / 2, 0, height - TargetSize);
-
-        return new Rectangle(x, y, TargetSize, TargetSize);
+        return (processedImage, processedMask);
     }
 
     private (DenseTensor<float>, DenseTensor<float>) CreateTensors(Image<Rgba32> image, Image<Rgba32> mask)
     {
-        var imgTensor = new DenseTensor<float>(new[] { 1, 3, TargetSize, TargetSize });
+        var imageTensor = new DenseTensor<float>(new[] { 1, 3, TargetSize, TargetSize });
         var maskTensor = new DenseTensor<float>(new[] { 1, 1, TargetSize, TargetSize });
 
+        // Заполнение тензора изображения (RGB порядок, нормализация [0, 1])
         image.ProcessPixelRows(accessor =>
         {
             for (int y = 0; y < TargetSize; y++)
@@ -100,13 +93,14 @@ public sealed class ImageInpainter : IDisposable
                 var row = accessor.GetRowSpan(y);
                 for (int x = 0; x < TargetSize; x++)
                 {
-                    imgTensor[0, 0, y, x] = row[x].R / 255f;
-                    imgTensor[0, 1, y, x] = row[x].G / 255f;
-                    imgTensor[0, 2, y, x] = row[x].B / 255f;
+                    imageTensor[0, 0, y, x] = row[x].R / 255f; // R
+                    imageTensor[0, 1, y, x] = row[x].G / 255f; // G
+                    imageTensor[0, 2, y, x] = row[x].B / 255f; // B
                 }
             }
         });
 
+        // Заполнение тензора маски (1.0 для областей восстановления)
         mask.ProcessPixelRows(accessor =>
         {
             for (int y = 0; y < TargetSize; y++)
@@ -114,18 +108,19 @@ public sealed class ImageInpainter : IDisposable
                 var row = accessor.GetRowSpan(y);
                 for (int x = 0; x < TargetSize; x++)
                 {
-                    maskTensor[0, 0, y, x] = row[x].R > 128 ? 1f : 0f;
+                    maskTensor[0, 0, y, x] = row[x].R > 128 ? 1.0f : 0.0f;
                 }
             }
         });
 
-        return (imgTensor, maskTensor);
+        return (imageTensor, maskTensor);
     }
 
-    private Image<Rgba32> PasteResult(Tensor<float> tensor, Image<Rgba32> original, Rectangle crop)
+    private Image<Rgba32> ProcessOutput(Tensor<float> tensor, Image<Rgba32> original, Image<Rgba32> mask)
     {
         var output = new Image<Rgba32>(TargetSize, TargetSize);
 
+        // Конвертация тензора в изображение
         for (int y = 0; y < TargetSize; y++)
         {
             for (int x = 0; x < TargetSize; x++)
@@ -137,9 +132,18 @@ public sealed class ImageInpainter : IDisposable
             }
         }
 
-        var result = original.Clone();
-        result.Mutate(x => x.DrawImage(output, crop.Location, 1f));
+        // Возврат к исходному размеру
+        output.Mutate(x => x.Resize(original.Width, original.Height));
 
+        // Смешивание с оригиналом через маску
+        var result = original.Clone();
+        result.Mutate(ctx => ctx.DrawImage(output, new Point(0, 0), new GraphicsOptions
+        {
+            AlphaCompositionMode = PixelAlphaCompositionMode.SrcOver,
+            ColorBlendingMode = PixelColorBlendingMode.Normal
+        }));
+
+        result.SaveAsPng("debug_final.png");
         return result;
     }
 
