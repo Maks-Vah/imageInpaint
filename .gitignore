@@ -10,10 +10,6 @@
 *.userosscache
 *.sln.docstates
 
-# Игнорировать все файлы .onnx
-imagePain/Models/LaMa-Dilated.onnx
-imagePain/Models/lama_fp32.onnx
-
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 
